@@ -1,0 +1,31 @@
+[project]
+name = "staleness-pipeline"
+version = "0.1.0"
+description = "Detects stuck/stale sensor readings and reconstructs plausible values with Chronos Bolt Small."
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+    "torch>=2.0",
+    "chronos-forecasting",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# Tells setuptools where the actual package code lives — inside src/,
+# not the repo root. This is what makes `pip install -e .` work.
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: tests that hit the real Chronos model — skip with -k \"not real_chronos\" or -m \"not slow\"",
+]
