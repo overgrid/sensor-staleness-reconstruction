@@ -1,0 +1,11 @@
+# Installed so far, for detection.py + its tests.
+# We'll add torch / chronos-forecasting when we build reconstruction.py,
+# and mlflow when we build tracking.py — no need to install everything up front.
+
+pandas>=2.0
+matplotlib>=3.7
+pytest>=8.0
+
+# reconstruction.py — Chronos forecasting
+torch>=2.0
+chronos-forecasting
