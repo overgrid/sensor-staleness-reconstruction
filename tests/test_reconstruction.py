@@ -4,6 +4,7 @@ import torch
 
 from staleness_pipeline.reconstruction import (
     blend_bidirectional,
+    feather_edges,
     forecast_backward,
     forecast_forward,
     forecast_forward_chunked,
@@ -148,6 +149,59 @@ def test_blend_raises_on_mismatched_lengths():
 
     with pytest.raises(ValueError):
         blend_bidirectional(forward, backward)
+
+
+def test_feather_pulls_first_point_exactly_to_real_value_before():
+    index = pd.date_range("2026-01-01", periods=10, freq="10min", tz="UTC")
+    reconstructed = pd.Series([25.0] * 10, index=index)
+
+    result = feather_edges(reconstructed, real_value_before=20.0, real_value_after=None, feather_points=3)
+
+    assert result.iloc[0] == pytest.approx(20.0)
+
+
+def test_feather_pulls_last_point_exactly_to_real_value_after():
+    index = pd.date_range("2026-01-01", periods=10, freq="10min", tz="UTC")
+    reconstructed = pd.Series([25.0] * 10, index=index)
+
+    result = feather_edges(reconstructed, real_value_before=None, real_value_after=30.0, feather_points=3)
+
+    assert result.iloc[-1] == pytest.approx(30.0)
+
+
+def test_feather_leaves_the_middle_of_the_window_unchanged():
+    index = pd.date_range("2026-01-01", periods=10, freq="10min", tz="UTC")
+    reconstructed = pd.Series([25.0] * 10, index=index)
+
+    result = feather_edges(reconstructed, real_value_before=20.0, real_value_after=30.0, feather_points=3)
+
+    # Points far from either edge (index 4-5, well outside feather_points=3
+    # from either end) should be untouched.
+    assert result.iloc[4] == pytest.approx(25.0)
+    assert result.iloc[5] == pytest.approx(25.0)
+
+
+def test_feather_correction_tapers_off_moving_away_from_the_edge():
+    index = pd.date_range("2026-01-01", periods=10, freq="10min", tz="UTC")
+    reconstructed = pd.Series([25.0] * 10, index=index)
+
+    result = feather_edges(reconstructed, real_value_before=20.0, real_value_after=None, feather_points=3)
+
+    # The correction should shrink as we move away from the start —
+    # each successive point should be closer to the original 25.0.
+    correction_0 = abs(result.iloc[0] - 25.0)
+    correction_1 = abs(result.iloc[1] - 25.0)
+    correction_2 = abs(result.iloc[2] - 25.0)
+    assert correction_0 > correction_1 > correction_2
+
+
+def test_feather_with_no_real_values_returns_unchanged():
+    index = pd.date_range("2026-01-01", periods=5, freq="10min", tz="UTC")
+    reconstructed = pd.Series([25.0] * 5, index=index)
+
+    result = feather_edges(reconstructed, real_value_before=None, real_value_after=None)
+
+    assert list(result.values) == list(reconstructed.values)
 
 
 @pytest.mark.slow

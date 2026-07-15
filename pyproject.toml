@@ -8,12 +8,20 @@ dependencies = [
     "matplotlib>=3.7",
     "torch>=2.0",
     "chronos-forecasting",
+    "typer>=0.12",
+    "mlflow>=2.10",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
 ]
+
+# This is what makes automation trivial: once `pip install -e .` has run,
+# any shell (yours, cron, eventually CI) can just call `staleness offline`
+# instead of `python /some/path/script.py`.
+[project.scripts]
+staleness = "staleness_pipeline.cli:app"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

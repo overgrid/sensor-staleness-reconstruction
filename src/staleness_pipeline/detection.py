@@ -28,14 +28,25 @@ class StuckPeriod:
 def find_stuck_periods(
     series: pd.Series,
     min_stuck_hours: float = 0.25,
+    ffill_limit: int = 1,
 ) -> list[StuckPeriod]:
     """Detect runs of exactly-repeated values longer than min_stuck_hours.
 
     Args:
         series: sensor readings, indexed by timestamp (a DatetimeIndex).
             Must already be sorted chronologically — call
-            series.sort_index() first if you're not sure.
+            series.sort_index() first if you're not sure. May contain
+            NaN/null values (real APIs return nulls for missing readings).
         min_stuck_hours: minimum run duration to flag as stuck.
+        ffill_limit: real data can have isolated missing readings (a null
+            instead of a repeated value). Without handling this, a single
+            null in the middle of an otherwise-stuck run splits it into two
+            shorter runs that might each fall under min_stuck_hours and go
+            undetected entirely — the same underlying problem as a one-off
+            outlier reading interrupting a stuck run. Forward-filling small
+            gaps (default: 1 point) before grouping fixes this for isolated
+            nulls, without pretending we have real data for longer missing
+            stretches. Set to 0 to disable.
 
     Returns:
         List of StuckPeriod, in chronological order. Empty list if nothing
@@ -44,10 +55,16 @@ def find_stuck_periods(
     if series.empty:
         return []
 
+    # Grouping is computed on a forward-filled copy (so isolated nulls
+    # don't break up a real stuck run), but stuck_value/reporting below
+    # still reads from the ORIGINAL series — we're only using the filled
+    # version to decide where group boundaries fall.
+    grouping_series = series.ffill(limit=ffill_limit) if ffill_limit > 0 else series
+
     # Same trick as the original script: `changed` is True at every point
     # the value differs from the one before it. cumsum() over that turns
     # each run of identical values into its own group id.
-    changed = series.ne(series.shift())
+    changed = grouping_series.ne(grouping_series.shift())
     group_id = changed.cumsum()
 
     periods: list[StuckPeriod] = []

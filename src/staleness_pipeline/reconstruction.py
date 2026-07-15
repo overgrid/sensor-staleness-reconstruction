@@ -13,9 +13,22 @@ model's.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
 import torch
+
+from staleness_pipeline.detection import StuckPeriod
+
+
+@dataclass
+class Reconstruction:
+    sensor: str
+    start_time: pd.Timestamp
+    end_time: pd.Timestamp
+    values: pd.Series
+    method: str  # "chronos-bolt-small-bidirectional" or "chronos-bolt-small-forward-only"
 
 
 def forecast_forward(pipeline, context: pd.Series, steps: int) -> pd.Series:
@@ -202,3 +215,116 @@ def blend_bidirectional(forward: pd.Series, backward: pd.Series) -> pd.Series:
     blended_values = forward.to_numpy() * forward_weight + backward.to_numpy() * (1 - forward_weight)
 
     return pd.Series(blended_values, index=forward.index, name=forward.name)
+
+
+def feather_edges(
+    reconstructed: pd.Series,
+    real_value_before: float | None,
+    real_value_after: float | None,
+    feather_points: int = 3,
+) -> pd.Series:
+    """Smooth the seam where reconstructed values meet real data.
+
+    Even after blending, nothing guarantees the reconstruction's first
+    point lands exactly on real_value_before, or its last point lands
+    exactly on real_value_after — small mismatches show up as a visible
+    jump on a plot right at the boundary. This nudges the first/last
+    `feather_points` reconstructed values toward the real neighboring
+    value, with the correction shrinking to zero by the time it reaches
+    `feather_points` in from each edge — so only the boundary gets
+    corrected, not the whole reconstruction.
+
+    Args:
+        reconstructed: the blended forward+backward reconstruction.
+        real_value_before: the real value immediately before the gap, or
+            None for an open-ended run with no "before" — skips the start.
+        real_value_after: the real value immediately after the gap, or
+            None for an open-ended run with no "after" yet — skips the end.
+        feather_points: how many points at each edge to taper the
+            correction over.
+    """
+    n = len(reconstructed)
+    if n == 0:
+        return reconstructed
+
+    values = reconstructed.to_numpy().copy()
+    feather_points = min(feather_points, n)
+
+    if real_value_before is not None:
+        start_offset = real_value_before - values[0]
+        # weight 1.0 at the very first point, tapering to 0.0 by feather_points in.
+        weights = np.linspace(1.0, 0.0, feather_points, endpoint=False)
+        values[:feather_points] += start_offset * weights
+
+    if real_value_after is not None:
+        end_offset = real_value_after - values[-1]
+        # Same shape as the start weights (1.0 at the edge, tapering
+        # inward), but reversed so the *last* point gets full weight.
+        weights = np.linspace(1.0, 0.0, feather_points, endpoint=False)[::-1]
+        values[-feather_points:] += end_offset * weights
+
+    return pd.Series(values, index=reconstructed.index, name=reconstructed.name)
+
+
+def reconstruct_stale_window(
+    pipeline,
+    series: pd.Series,
+    period: StuckPeriod,
+    max_chunk_size: int = 64,
+    max_context_length: int = 512,
+    feather_points: int = 3,
+) -> Reconstruction:
+    """Reconstruct one detected stuck window, end to end.
+
+    Ties together everything else in this module: figures out how many
+    points need reconstructing, runs forward-only for an open-ended run or
+    forward+backward+blend for a resolved one, then feathers the edges.
+
+    Args:
+        pipeline: a loaded Chronos pipeline (see chronos_model.py).
+        series: the FULL raw series for this sensor, real timestamps and
+            values — including the stuck/repeated readings themselves
+            (they're used only to count how many points to reconstruct,
+            never as forecasting context).
+        period: one StuckPeriod from detection.find_stuck_periods().
+
+    Returns:
+        A Reconstruction with one predicted value per stuck timestamp.
+    """
+    context_before = series.loc[series.index < period.start_time]
+    if context_before.empty:
+        raise ValueError(
+            f"No real data before {period.start_time} — can't reconstruct without prior context."
+        )
+
+    stuck_mask = (series.index >= period.start_time) & (series.index <= period.end_time)
+    steps = int(stuck_mask.sum())
+
+    forward = forecast_forward_chunked(pipeline, context_before, steps, max_chunk_size, max_context_length)
+    real_value_before = context_before.iloc[-1]
+
+    context_after = series.loc[series.index > period.end_time]
+
+    if context_after.empty:
+        # No real data after the stuck run at all — it's still ongoing
+        # (or this is the very end of the series). Forward-only is the
+        # only option; detection.py doesn't currently distinguish this
+        # case from any other stuck run, so we infer it here from context.
+        reconstructed = forward
+        real_value_after = None
+        method = "chronos-bolt-small-forward-only"
+    else:
+        backward = forecast_backward(pipeline, context_after, steps, max_chunk_size, max_context_length)
+        reconstructed = blend_bidirectional(forward, backward)
+        real_value_after = context_after.iloc[0]
+        method = "chronos-bolt-small-bidirectional"
+
+    reconstructed = feather_edges(reconstructed, real_value_before, real_value_after, feather_points)
+
+    return Reconstruction(
+        sensor=str(series.name),
+        start_time=period.start_time,
+        end_time=period.end_time,
+        values=reconstructed,
+        method=method,
+    )
