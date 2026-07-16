@@ -298,9 +298,16 @@ def reconstruct_stale_window(
         )
 
     stuck_mask = (series.index >= period.start_time) & (series.index <= period.end_time)
-    steps = int(stuck_mask.sum())
+    gap_index = series.index[stuck_mask]
+    steps = len(gap_index)
 
     forward = forecast_forward_chunked(pipeline, context_before, steps, max_chunk_size, max_context_length)
+    # forecast_forward_chunked computes its own timestamps from cadence
+    # (context's last two points). Real-world data isn't always perfectly
+    # evenly spaced, so that computed index can drift slightly from the
+    # ACTUAL real timestamps this gap covers — realign onto the real ones,
+    # which we already know exactly from gap_index above.
+    forward = pd.Series(forward.to_numpy(), index=gap_index, name=forward.name)
     real_value_before = context_before.iloc[-1]
 
     context_after = series.loc[series.index > period.end_time]
@@ -315,6 +322,11 @@ def reconstruct_stale_window(
         method = "chronos-bolt-small-forward-only"
     else:
         backward = forecast_backward(pipeline, context_after, steps, max_chunk_size, max_context_length)
+        # Same realignment as forward, and for the same reason — this is
+        # also what makes blend_bidirectional's index check actually pass
+        # on real data instead of only ever passing in tests with
+        # perfectly uniform synthetic timestamps.
+        backward = pd.Series(backward.to_numpy(), index=gap_index, name=backward.name)
         reconstructed = blend_bidirectional(forward, backward)
         real_value_after = context_after.iloc[0]
         method = "chronos-bolt-small-bidirectional"

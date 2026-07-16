@@ -2,12 +2,14 @@ import pandas as pd
 import pytest
 import torch
 
+from staleness_pipeline.detection import StuckPeriod
 from staleness_pipeline.reconstruction import (
     blend_bidirectional,
     feather_edges,
     forecast_backward,
     forecast_forward,
     forecast_forward_chunked,
+    reconstruct_stale_window,
 )
 
 
@@ -202,6 +204,110 @@ def test_feather_with_no_real_values_returns_unchanged():
     result = feather_edges(reconstructed, real_value_before=None, real_value_after=None)
 
     assert list(result.values) == list(reconstructed.values)
+
+
+def make_full_series(before, stuck_value, stuck_count, after, freq="10min"):
+    """Builds one continuous series: real values, then a stuck run, then
+    more real values (or none, for an open-ended run)."""
+    values = before + [stuck_value] * stuck_count + after
+    index = pd.date_range("2026-01-01", periods=len(values), freq=freq, tz="UTC")
+    return pd.Series(values, index=index, name="test_sensor")
+
+
+def test_reconstruct_bidirectional_window_covers_the_full_stuck_range():
+    series = make_full_series(before=[20.0, 20.5, 21.0], stuck_value=21.0, stuck_count=4, after=[19.0, 19.5])
+    period = StuckPeriod(
+        sensor="test_sensor",
+        stuck_value=21.0,
+        start_time=series.index[3],
+        end_time=series.index[6],
+        duration_hours=0.5,
+    )
+
+    result = reconstruct_stale_window(FakePipeline(), series, period)
+
+    assert len(result.values) == 4
+    assert result.method == "chronos-bolt-small-bidirectional"
+    assert result.start_time == series.index[3]
+    assert result.end_time == series.index[6]
+
+
+def test_reconstruct_open_ended_window_uses_forward_only():
+    # No real data after the stuck run — it's still ongoing. detection.py
+    # doesn't flag this specially yet; reconstruct_stale_window infers it
+    # from there being no context_after at all.
+    series = make_full_series(before=[20.0, 20.5, 21.0], stuck_value=21.0, stuck_count=4, after=[])
+    period = StuckPeriod(
+        sensor="test_sensor",
+        stuck_value=21.0,
+        start_time=series.index[3],
+        end_time=series.index[-1],
+        duration_hours=0.5,
+    )
+
+    result = reconstruct_stale_window(FakePipeline(), series, period)
+
+    assert len(result.values) == 4
+    assert result.method == "chronos-bolt-small-forward-only"
+
+
+def test_reconstruct_raises_when_no_context_before_the_gap():
+    # Stuck run starts at the very first timestamp — nothing real before it.
+    series = make_full_series(before=[], stuck_value=21.0, stuck_count=4, after=[19.0, 19.5])
+    period = StuckPeriod(
+        sensor="test_sensor",
+        stuck_value=21.0,
+        start_time=series.index[0],
+        end_time=series.index[3],
+        duration_hours=0.5,
+    )
+
+    with pytest.raises(ValueError):
+        reconstruct_stale_window(FakePipeline(), series, period)
+
+
+def test_reconstruct_handles_irregular_real_world_cadence():
+    # Regression test: real Overgrid data isn't always perfectly evenly
+    # spaced. If the gap right before the timestamps differs slightly from
+    # the gap right after (e.g. 10 minutes vs 9 minutes, from a slightly
+    # early/late real reading), forecast_forward and forecast_backward
+    # used to each compute their OWN timestamps from local cadence math —
+    # which could drift apart and fail blend_bidirectional's index check,
+    # even though the actual real gap timestamps are perfectly well-defined.
+    before_index = pd.date_range("2026-01-01 00:00", periods=3, freq="10min", tz="UTC")
+    # Stuck run: irregular internal spacing (10 min, then 9 min) —
+    # realistic for a resampled/aggregated real-world export.
+    stuck_index = pd.DatetimeIndex(
+        [
+            before_index[-1] + pd.Timedelta(minutes=10),
+            before_index[-1] + pd.Timedelta(minutes=20),
+            before_index[-1] + pd.Timedelta(minutes=29),  # 9 minutes, not 10
+        ]
+    )
+    # After-gap cadence also slightly different from before-gap cadence.
+    after_index = pd.DatetimeIndex(
+        [
+            stuck_index[-1] + pd.Timedelta(minutes=11),
+            stuck_index[-1] + pd.Timedelta(minutes=21),
+        ]
+    )
+
+    full_index = before_index.append(stuck_index).append(after_index)
+    values = [20.0, 20.5, 21.0, 21.0, 21.0, 21.0, 19.0, 19.5]
+    series = pd.Series(values, index=full_index, name="test_sensor")
+
+    period = StuckPeriod(
+        sensor="test_sensor",
+        stuck_value=21.0,
+        start_time=stuck_index[0],
+        end_time=stuck_index[-1],
+        duration_hours=0.5,
+    )
+
+    # Should not raise — forward and backward get realigned onto the real
+    # gap timestamps before blending, regardless of local cadence drift.
+    result = reconstruct_stale_window(FakePipeline(), series, period)
+    assert list(result.values.index) == list(stuck_index)
 
 
 @pytest.mark.slow
