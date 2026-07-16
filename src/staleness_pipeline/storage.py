@@ -40,6 +40,9 @@ class ImputationConfidence(str, Enum):
 @dataclass
 class ImputedMeasurement:
     point_id: str
+    sensor: str                   # e.g. "aht_temperature" — distinguishes records that
+                                   # share a point_id (e.g. equipment ID used as a CSV-testing
+                                   # stand-in for a real per-attribute Point.id)
     timestamp: datetime
     raw_value: float | None       # None if there's no real reading at all for this timestamp
     imputed_value: float
@@ -84,6 +87,7 @@ def reconstruction_to_measurements(
         measurements.append(
             ImputedMeasurement(
                 point_id=point_id,
+                sensor=reconstruction.sensor,
                 timestamp=ts,
                 raw_value=raw_value,
                 imputed_value=float(imputed_value),
