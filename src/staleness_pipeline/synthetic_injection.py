@@ -29,12 +29,18 @@ def inject_synthetic_gap(
     gap_length_points: int,
     min_context_points: int = 10,
     rng_seed: int | None = None,
+    max_attempts: int = 50,
 ) -> tuple[StuckPeriod, pd.Series]:
     """Pick a random real stretch of `gap_length_points` and pretend it's a
     stuck window that needs reconstructing.
 
     Args:
-        series: real sensor data, indexed by timestamp.
+        series: real sensor data, indexed by timestamp. May contain nulls
+            elsewhere (real Overgrid data does) — but the chosen window and
+            its immediate boundary values must be null-free, or every
+            downstream metric silently becomes NaN (one missing point out
+            of 200 poisons the whole trial's MAE/RMSE/MAPE, for Chronos AND
+            both baselines — this isn't specific to the model).
         gap_length_points: how many points the fake gap should span.
         min_context_points: how much real data must exist on each side —
             reconstruction needs real context to work with, and a fair
@@ -42,6 +48,8 @@ def inject_synthetic_gap(
             series where there's barely any.
         rng_seed: for reproducible trials (score_reconstruction across
             trials needs to compare the same fake gaps run to run).
+        max_attempts: how many random windows to try before giving up if
+            the data is too full of nulls to find a clean one.
 
     Returns:
         (synthetic_period, hidden_true_values) — the StuckPeriod to feed
@@ -58,20 +66,37 @@ def inject_synthetic_gap(
     rng = random.Random(rng_seed)
     earliest_start = min_context_points
     latest_start = n - gap_length_points - min_context_points
-    start_idx = rng.randint(earliest_start, latest_start)
-    end_idx = start_idx + gap_length_points - 1
 
-    hidden_true_values = series.iloc[start_idx : end_idx + 1]
-    duration = series.index[end_idx] - series.index[start_idx]
+    for _ in range(max_attempts):
+        start_idx = rng.randint(earliest_start, latest_start)
+        end_idx = start_idx + gap_length_points - 1
 
-    period = StuckPeriod(
-        sensor=str(series.name),
-        stuck_value=float("nan"),  # meaningless here — this isn't a real stuck run
-        start_time=series.index[start_idx],
-        end_time=series.index[end_idx],
-        duration_hours=round(duration.total_seconds() / 3600, 2),
+        hidden_true_values = series.iloc[start_idx : end_idx + 1]
+        boundary_before = series.iloc[start_idx - 1]
+        boundary_after = series.iloc[end_idx + 1] if end_idx + 1 < n else None
+
+        if hidden_true_values.isna().any():
+            continue
+        if pd.isna(boundary_before):
+            continue
+        if boundary_after is not None and pd.isna(boundary_after):
+            continue
+
+        duration = series.index[end_idx] - series.index[start_idx]
+        period = StuckPeriod(
+            sensor=str(series.name),
+            stuck_value=float("nan"),  # meaningless here — this isn't a real stuck run
+            start_time=series.index[start_idx],
+            end_time=series.index[end_idx],
+            duration_hours=round(duration.total_seconds() / 3600, 2),
+        )
+        return period, hidden_true_values
+
+    raise ValueError(
+        f"Could not find a {gap_length_points}-point window without nulls after "
+        f"{max_attempts} attempts — this sensor's data may have too many missing "
+        "readings for validation at this gap length."
     )
-    return period, hidden_true_values
 
 
 def compute_naive_baselines(

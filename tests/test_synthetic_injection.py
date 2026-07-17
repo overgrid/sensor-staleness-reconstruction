@@ -58,6 +58,43 @@ def test_inject_synthetic_gap_is_reproducible_with_same_seed():
     assert period_a.start_time == period_b.start_time
 
 
+def test_inject_synthetic_gap_never_returns_a_window_containing_nulls():
+    # A null sits right where the first several random draws would likely
+    # land (deterministic given rng_seed=1) — proves the retry logic
+    # actually skips bad windows instead of returning one with a NaN in it.
+    values = [float(i) for i in range(50)]
+    values[25] = float("nan")
+    series = make_series(values)
+
+    for seed in range(20):  # try several seeds, not just one lucky draw
+        period, hidden = inject_synthetic_gap(series, gap_length_points=5, min_context_points=10, rng_seed=seed)
+        assert not hidden.isna().any()
+
+
+def test_inject_synthetic_gap_avoids_null_boundary_values_too():
+    # A null sits just outside where a gap would land, but exactly where a
+    # baseline's boundary value (last real point before the gap) would be
+    # read from — this must ALSO be avoided, or forward_fill/linear_interp
+    # baselines end up NaN even though the gap itself looks clean.
+    values = [float(i) for i in range(50)]
+    values[19] = float("nan")  # would be context_before.iloc[-1] for a gap starting at 20
+    series = make_series(values)
+
+    for seed in range(20):
+        period, hidden = inject_synthetic_gap(series, gap_length_points=5, min_context_points=10, rng_seed=seed)
+        boundary_before = series.loc[series.index < period.start_time].iloc[-1]
+        assert not pd.isna(boundary_before)
+
+
+def test_inject_synthetic_gap_raises_clear_error_when_no_clean_window_exists():
+    # Nulls everywhere — no window of this length can possibly be clean.
+    values = [float(i) if i % 2 == 0 else float("nan") for i in range(50)]
+    series = make_series(values)
+
+    with pytest.raises(ValueError, match="null"):
+        inject_synthetic_gap(series, gap_length_points=5, min_context_points=10, rng_seed=1, max_attempts=10)
+
+
 def test_forward_fill_baseline_repeats_the_last_real_value():
     series = make_series([10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
     period, hidden = inject_synthetic_gap(series, gap_length_points=2, min_context_points=2, rng_seed=0)

@@ -28,7 +28,11 @@ logger = logging.getLogger(__name__)
 # Matches the real gap-length distribution from your original validation:
 # ~7 pts / ~35 min, ~60 pts / ~5 hr, ~200 pts / ~16-25 hr.
 VALIDATION_GAP_LENGTHS = [7, 60, 200]
-VALIDATION_TRIALS_PER_LENGTH = 3
+# 3 trials gave a first read but was too noisy to trust individual
+# "beats_X" fractions (0/3 vs 1/3 is a big swing from a single flip).
+# 10 gives a meaningfully steadier picture without making each run take
+# drastically longer.
+VALIDATION_TRIALS_PER_LENGTH = 10
 
 
 def run_validation(pipeline, series, tracker: Tracker) -> None:
@@ -36,25 +40,36 @@ def run_validation(pipeline, series, tracker: Tracker) -> None:
     MLflow. This is what makes RECONCILED confidence earned rather than
     assumed. Gap lengths too long for the available data (e.g. a 200-point
     gap on a 60-point series) are skipped with a warning, not a crash —
-    that's expected on short test datasets, not an error."""
+    that's expected on short test datasets, not an error.
+
+    Trials are averaged before logging. Logging each trial under the same
+    metric key with no step counter would make MLflow silently overwrite
+    each one with the latest — defeating the entire point of running
+    multiple trials to smooth out one lucky/unlucky random gap."""
     with tracker.run(run_name=f"validate-{series.name}", tags={"sensor": str(series.name)}):
         for gap_length in VALIDATION_GAP_LENGTHS:
+            trial_results = []
             for trial in range(VALIDATION_TRIALS_PER_LENGTH):
                 try:
-                    result = run_gap_trial(pipeline, series, gap_length, trial, rng_seed=trial)
+                    trial_results.append(run_gap_trial(pipeline, series, gap_length, trial, rng_seed=trial))
                 except ValueError as e:
                     logger.warning("Skipping validation trial (gap=%d, trial=%d): %s", gap_length, trial, e)
-                    continue
 
-                tracker.log_metrics(
-                    {
-                        f"chronos_mae_gap{gap_length}": result.chronos_mae,
-                        f"forward_fill_mae_gap{gap_length}": result.forward_fill_mae,
-                        f"linear_interp_mae_gap{gap_length}": result.linear_interp_mae,
-                        f"beats_forward_fill_gap{gap_length}": float(result.beats_forward_fill),
-                        f"beats_linear_interp_gap{gap_length}": float(result.beats_linear_interp),
-                    }
-                )
+            if not trial_results:
+                continue
+
+            n = len(trial_results)
+            tracker.log_metrics(
+                {
+                    f"chronos_mae_gap{gap_length}": sum(r.chronos_mae for r in trial_results) / n,
+                    f"forward_fill_mae_gap{gap_length}": sum(r.forward_fill_mae for r in trial_results) / n,
+                    f"linear_interp_mae_gap{gap_length}": sum(r.linear_interp_mae for r in trial_results) / n,
+                    # fraction of trials Chronos beat each baseline, not just a single 0/1
+                    f"beats_forward_fill_gap{gap_length}": sum(r.beats_forward_fill for r in trial_results) / n,
+                    f"beats_linear_interp_gap{gap_length}": sum(r.beats_linear_interp for r in trial_results) / n,
+                    f"num_trials_gap{gap_length}": float(n),
+                }
+            )
 
 
 def run_offline_job(
