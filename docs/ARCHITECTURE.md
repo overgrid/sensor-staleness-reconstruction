@@ -279,3 +279,12 @@ explicit.
   interpolation may be preferable to Chronos at short/medium gaps, but
   `reconstruct_stale_window()` currently always uses Chronos regardless of
   gap length. Deliberately not changed yet, pending a decision.
+- **MLflow authentication without a manual SSH tunnel** — MLflow is
+  currently only reachable by tunneling directly to its port, bypassing a
+  JupyterHub proxy that gates the public URL behind browser-session auth
+  (see README). That's fine for interactive use, but not viable for
+  anything automated (cron, CI) — nothing will be sitting there manually
+  opening a tunnel at 2am. Needs a real fix: either a service
+  account/token MLflow itself accepts (bypassing the JupyterHub proxy
+  legitimately), or the proxy's auth scheme investigated for a
+  script-friendly path in. Flagged to revisit after the Kafka work.
