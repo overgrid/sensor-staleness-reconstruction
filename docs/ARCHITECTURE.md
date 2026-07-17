@@ -5,6 +5,17 @@ it is, and what it deliberately does NOT do yet. Read this alongside the
 docstrings in each file — this document explains the *reasoning* behind
 decisions; the docstrings explain the *mechanics*.
 
+## Related work
+
+Before investing further in Kafka/automation, a survey of existing
+projects tackling similar problems was done — see
+[`RELATED_WORK.md`](RELATED_WORK.md). Short version: no existing
+open-source project combines stuck-detection + Chronos-based
+reconstruction + honest baseline validation + this specific GraphQL/MLflow
+integration. The closest single match is
+[PyPOTS](https://github.com/WenjieDu/PyPOTS), a general-purpose imputation
+library — worth knowing about, not a replacement for this pipeline.
+
 ## Data flow, end to end
 
 ```
@@ -132,6 +143,39 @@ only means changing this one file. Two things carried over from the real
 schema on purpose: timestamps get parsed from strings (the API returns
 strings too), and nulls are preserved as `NaN` rather than dropped (the
 API's `Measurement.value` is nullable).
+
+---
+
+---
+
+## `graphql_source.py`
+
+**What it does:** live counterpart to `data_source.py` — fetches sensor
+data directly from Overgrid's GraphQL API instead of reading a CSV.
+
+**Key functions:**
+- `build_client(endpoint, token)` → a `gql` client, token from
+  `OVERGRID_TOKEN` env var by default
+- `fetch_points(client, alias, equipment_id, attribute, start_date,
+  end_date, every, fn)` → `list[PointData]`
+- `fetch_recent_points(...)` → convenience wrapper for "last N days"
+
+**Design notes:**
+- Ported from an existing, already-validated reference script
+  (`dataset_builder.py`), trimmed to just what this pipeline needs — no
+  CSV writing, no wide-pivot table.
+- Pivots on `point.id` — the only field the schema guarantees unique —
+  rather than `equipment_id`. This fixes a real limitation from CSV-only
+  testing: CLI usage had been passing an equipment_id as `--point-id`,
+  since the CSV export doesn't carry real per-attribute Point IDs. Each
+  `PointData` now carries the genuine, unique `point_id` for its sensor.
+- Doesn't hardcode any `.env` file path (the reference script's
+  `/etc/overgrid/.env` is specific to `host241`) — `OVERGRID_TOKEN` must
+  be set in the environment however fits wherever this runs.
+- Same output shape as `data_source.py` (`pandas.Series`, real UTC
+  timestamps, clean attribute name) — but **not yet wired into
+  `offline_job.py`/`cli.py`**. The module exists and is tested; nothing
+  calls it yet.
 
 ---
 
@@ -288,3 +332,7 @@ explicit.
   account/token MLflow itself accepts (bypassing the JupyterHub proxy
   legitimately), or the proxy's auth scheme investigated for a
   script-friendly path in. Flagged to revisit after the Kafka work.
+- **A third validation baseline from PyPOTS** — see `RELATED_WORK.md`.
+  `synthetic_injection.py` currently only compares against forward-fill
+  and linear interpolation; a simple classical PyPOTS method could
+  strengthen the validation story further. Not started.
