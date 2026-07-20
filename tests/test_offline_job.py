@@ -153,3 +153,76 @@ def test_run_validation_averages_trials_instead_of_only_keeping_the_last_one(sam
     expected_mean = sum(i * 10 for i in range(n_trials)) / n_trials
     assert gap7_metrics[0]["chronos_mae_gap7"] == pytest.approx(expected_mean)
     assert gap7_metrics[0]["num_trials_gap7"] == float(n_trials)
+
+
+def make_fake_point(point_id="real-point-abc", attribute="aht_temperature"):
+    from staleness_pipeline.graphql_source import PointData
+
+    n = 60
+    values = [20.0 + (i % 5) * 0.1 for i in range(n)]
+    for i in range(30, 36):  # a real stuck run: 6 points
+        values[i] = 21.0
+    index = pd.date_range("2026-01-01", periods=n, freq="10min", tz="UTC")
+    series = pd.Series(values, index=index, name=attribute)
+
+    return PointData(
+        point_id=point_id,
+        equipment_id="equip-1",
+        equipment_type="Air_Temperature_Sensor",
+        point_type="Air_Temperature_Sensor",
+        attribute=attribute,
+        series=series,
+    )
+
+
+def test_run_offline_job_live_uses_the_real_point_id_from_the_api(monkeypatch):
+    monkeypatch.setattr(offline_job, "get_chronos_pipeline", lambda: FakePipeline())
+    monkeypatch.setattr(offline_job, "build_client", lambda token=None: object())
+    monkeypatch.setattr(offline_job, "fetch_recent_points", lambda *a, **kw: [make_fake_point()])
+
+    results = offline_job.run_offline_job_live(
+        alias="MyHome",
+        equipment_id="equip-1",
+        attribute="aht_temperature",
+        mlflow_enabled=False,
+        run_validation_first=False,
+    )
+
+    assert results == {"real-point-abc": 6}
+
+
+def test_run_offline_job_live_processes_multiple_points_independently(monkeypatch):
+    monkeypatch.setattr(offline_job, "get_chronos_pipeline", lambda: FakePipeline())
+    monkeypatch.setattr(offline_job, "build_client", lambda token=None: object())
+    fake_points = [
+        make_fake_point(point_id="point-temp", attribute="aht_temperature"),
+        make_fake_point(point_id="point-humidity", attribute="aht_humidity"),
+    ]
+    monkeypatch.setattr(offline_job, "fetch_recent_points", lambda *a, **kw: fake_points)
+
+    results = offline_job.run_offline_job_live(
+        alias="MyHome",
+        equipment_id="equip-1",
+        attribute="aht_temperature,aht_humidity",
+        mlflow_enabled=False,
+        run_validation_first=False,
+    )
+
+    assert set(results.keys()) == {"point-temp", "point-humidity"}
+    assert all(count == 6 for count in results.values())
+
+
+def test_run_offline_job_live_returns_empty_dict_when_no_points_found(monkeypatch):
+    monkeypatch.setattr(offline_job, "get_chronos_pipeline", lambda: FakePipeline())
+    monkeypatch.setattr(offline_job, "build_client", lambda token=None: object())
+    monkeypatch.setattr(offline_job, "fetch_recent_points", lambda *a, **kw: [])
+
+    results = offline_job.run_offline_job_live(
+        alias="MyHome",
+        equipment_id="equip-1",
+        attribute="nonexistent_attribute",
+        mlflow_enabled=False,
+        run_validation_first=False,
+    )
+
+    assert results == {}

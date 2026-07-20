@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import logging
 
+import pandas as pd
+
 from staleness_pipeline.chronos_model import get_chronos_pipeline
 from staleness_pipeline.data_source import load_series_from_csv
 from staleness_pipeline.detection import find_stuck_periods
+from staleness_pipeline.graphql_source import build_client, fetch_recent_points
 from staleness_pipeline.reconstruction import reconstruct_stale_window
 from staleness_pipeline.storage import ImputationConfidence, get_sink, reconstruction_to_measurements
 from staleness_pipeline.synthetic_injection import run_gap_trial
@@ -72,9 +75,8 @@ def run_validation(pipeline, series, tracker: Tracker) -> None:
             )
 
 
-def run_offline_job(
-    csv_path: str,
-    column: str,
+def run_offline_job_for_series(
+    series: pd.Series,
     point_id: str,
     min_stuck_hours: float = 0.25,
     sink_backend: str = "local_jsonl",
@@ -84,12 +86,13 @@ def run_offline_job(
     mlflow_enabled: bool = True,
     run_validation_first: bool = True,
 ) -> int:
-    """Run the full offline pipeline for one sensor column.
+    """Core pipeline logic, operating on an already-loaded series. Source
+    (CSV, live GraphQL, anything else) is irrelevant here — this is what
+    both run_offline_job() and run_offline_job_live() actually call.
 
     Returns:
         Number of reconstructed measurements written.
     """
-    series = load_series_from_csv(csv_path, column=column)
     pipeline = get_chronos_pipeline()
     tracker = get_tracker(mlflow_tracking_uri, mlflow_experiment_name, enabled=mlflow_enabled)
     sink = get_sink(sink_backend, local_sink_path)
@@ -120,3 +123,99 @@ def run_offline_job(
     sink.write(all_measurements)
     logger.info("Wrote %d reconstructed points for %s", len(all_measurements), series.name)
     return len(all_measurements)
+
+
+def run_offline_job(
+    csv_path: str,
+    column: str,
+    point_id: str,
+    min_stuck_hours: float = 0.25,
+    sink_backend: str = "local_jsonl",
+    local_sink_path: str = "data/reconstructed_measurements.jsonl",
+    mlflow_tracking_uri: str = "http://localhost:5000",
+    mlflow_experiment_name: str = "chronos-staleness-reconstruction",
+    mlflow_enabled: bool = True,
+    run_validation_first: bool = True,
+) -> int:
+    """Run the full offline pipeline for one sensor column, from a CSV.
+
+    Note: point_id here is typically an equipment_id stand-in, since the
+    CSV export doesn't carry real per-attribute Point IDs — see
+    run_offline_job_live() for the version that discovers real point_ids
+    automatically.
+
+    Returns:
+        Number of reconstructed measurements written.
+    """
+    series = load_series_from_csv(csv_path, column=column)
+    return run_offline_job_for_series(
+        series,
+        point_id,
+        min_stuck_hours=min_stuck_hours,
+        sink_backend=sink_backend,
+        local_sink_path=local_sink_path,
+        mlflow_tracking_uri=mlflow_tracking_uri,
+        mlflow_experiment_name=mlflow_experiment_name,
+        mlflow_enabled=mlflow_enabled,
+        run_validation_first=run_validation_first,
+    )
+
+
+def run_offline_job_live(
+    alias: str,
+    equipment_id: str | None,
+    attribute: str | None,
+    days_back: int = 30,
+    every: str = "10m",
+    fn: str = "mean",
+    token: str | None = None,
+    min_stuck_hours: float = 0.25,
+    sink_backend: str = "local_jsonl",
+    local_sink_path: str = "data/reconstructed_measurements.jsonl",
+    mlflow_tracking_uri: str = "http://localhost:5000",
+    mlflow_experiment_name: str = "chronos-staleness-reconstruction",
+    mlflow_enabled: bool = True,
+    run_validation_first: bool = True,
+) -> dict[str, int]:
+    """Run the full offline pipeline against LIVE Overgrid data via
+    GraphQL, instead of a CSV export.
+
+    `attribute` can be comma-separated (e.g. "aht_temperature,aht_humidity")
+    to process several sensors in one call — each point fetched gets its
+    own run, using its REAL point_id (discovered from the API, not an
+    equipment_id stand-in).
+
+    Returns:
+        {point_id: measurements_written} — one entry per point that had
+        data. Empty dict if nothing matched the given filters.
+    """
+    client = build_client(token=token)
+    points = fetch_recent_points(client, alias, equipment_id, attribute, days_back, every, fn)
+
+    if not points:
+        logger.warning(
+            "No points with data found for alias=%s equipment_id=%s attribute=%s",
+            alias, equipment_id, attribute,
+        )
+        return {}
+
+    results: dict[str, int] = {}
+    for point in points:
+        logger.info(
+            "Processing point_id=%s attribute=%s (%d readings)",
+            point.point_id, point.attribute, len(point.series),
+        )
+        count = run_offline_job_for_series(
+            point.series,
+            point_id=point.point_id,
+            min_stuck_hours=min_stuck_hours,
+            sink_backend=sink_backend,
+            local_sink_path=local_sink_path,
+            mlflow_tracking_uri=mlflow_tracking_uri,
+            mlflow_experiment_name=mlflow_experiment_name,
+            mlflow_enabled=mlflow_enabled,
+            run_validation_first=run_validation_first,
+        )
+        results[point.point_id] = count
+
+    return results
