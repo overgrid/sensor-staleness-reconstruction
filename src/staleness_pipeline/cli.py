@@ -11,6 +11,7 @@ import logging
 
 import typer
 
+from staleness_pipeline.kafka_producer import DEFAULT_BOOTSTRAP_SERVERS, DEFAULT_TOPIC, stream_csv_to_kafka
 from staleness_pipeline.offline_job import run_offline_job, run_offline_job_live
 
 app = typer.Typer(help="Staleness detection & reconstruction pipeline.")
@@ -101,6 +102,70 @@ def offline_live(
         f"Done — processed {len(results)} point(s), "
         f"{sum(results.values())} total measurements written to {sink_path}"
     )
+
+
+@app.command()
+def simulate(
+    csv_path: str = typer.Option("data/hum_temp_wide.csv", help="Path to the wide-format CSV to replay."),
+    columns: str = typer.Option(
+        ..., help="Comma-separated exact CSV column name(s) to stream, e.g. one per sensor."
+    ),
+    point_id: str = typer.Option(..., help="Overgrid point_id these columns belong to."),
+    topic: str = typer.Option(DEFAULT_TOPIC, help="Kafka topic to publish to."),
+    bootstrap_servers: str = typer.Option(DEFAULT_BOOTSTRAP_SERVERS, help="Kafka bootstrap servers."),
+    speed: float = typer.Option(
+        60.0, help="Replay speed multiplier vs. real time (60 = a real hour every real minute)."
+    ),
+    loop: bool = typer.Option(
+        True, help="Keep looping the CSV indefinitely to simulate a continuous live feed. Ctrl+C to stop."
+    ),
+    no_remap: bool = typer.Option(
+        False, help="Send the CSV's original historical timestamps as-is, instead of shifting to 'now'."
+    ),
+) -> None:
+    """Replay real CSV sensor data onto Kafka at accelerated speed, simulating a live feed.
+
+    Requires a running Kafka broker (see docker-compose.yml) — start it
+    first with `docker compose up -d`.
+    """
+    logging.basicConfig(level=logging.INFO)
+    column_list = [c.strip() for c in columns.split(",") if c.strip()]
+    typer.echo(
+        f"Streaming {column_list} for point_id={point_id} -> topic={topic!r} "
+        f"@ {bootstrap_servers} (speed={speed}x, loop={loop}). Ctrl+C to stop."
+    )
+    stream_csv_to_kafka(
+        csv_path=csv_path,
+        columns=column_list,
+        point_id=point_id,
+        topic=topic,
+        bootstrap_servers=bootstrap_servers,
+        speed_multiplier=speed,
+        loop=loop,
+        remap_to_now=not no_remap,
+    )
+
+
+@app.command()
+def dashboard(
+    host: str = typer.Option("127.0.0.1", help="Interface to bind to. Use 127.0.0.1 behind nginx/a proxy."),
+    port: int = typer.Option(8091, help="Port to listen on."),
+) -> None:
+    """Run the live dashboard (FastAPI + WebSocket), reading from Kafka.
+
+    Configure the Kafka connection and detection thresholds via env vars:
+    STALENESS_KAFKA_BOOTSTRAP_SERVERS, STALENESS_KAFKA_TOPIC,
+    STALENESS_MIN_STUCK_HOURS, STALENESS_MAX_POINTS (see dashboard.py) —
+    defaults match `staleness simulate`'s own defaults, so both point at
+    the same local broker out of the box.
+
+    Requires a running Kafka broker with data on it — run `docker compose
+    up -d` and `staleness simulate` first.
+    """
+    import uvicorn
+
+    logging.basicConfig(level=logging.INFO)
+    uvicorn.run("staleness_pipeline.dashboard:app", host=host, port=port, reload=False)
 
 
 if __name__ == "__main__":

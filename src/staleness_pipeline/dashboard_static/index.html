@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Staleness live dashboard</title>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2f3a;
+    --text: #e6e6e6;
+    --muted: #8b93a3;
+    --accent: #4fc3f7;
+    --ok: #43b581;
+    --bad: #f04747;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 22px;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 17px; font-weight: 600; margin: 0; }
+  #status {
+    font-size: 13px;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  #status .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--bad);
+    display: inline-block;
+  }
+  #status.connected .dot { background: var(--ok); }
+  .legend-key {
+    display: flex; gap: 16px; padding: 10px 22px; font-size: 12px; color: var(--muted);
+    border-bottom: 1px solid var(--border); flex-wrap: wrap;
+  }
+  .legend-key span { display: flex; align-items: center; gap: 6px; }
+  .swatch { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+  #charts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(480px, 1fr));
+    gap: 18px;
+    padding: 18px 22px;
+  }
+  .chart-container {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px 6px;
+  }
+  .chart-container h3 {
+    margin: 0 0 6px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .chart-container .sub {
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .plot { width: 100%; height: 320px; }
+  #empty {
+    padding: 40px 22px;
+    color: var(--muted);
+    font-size: 14px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Staleness pipeline — live view</h1>
+  <div id="status"><span class="dot"></span><span id="status-text">connecting…</span></div>
+</header>
+
+<div class="legend-key">
+  <span><span class="swatch" style="background:#1f77b4"></span> raw reading</span>
+  <span><span class="swatch" style="background:#ff7f0e"></span> reconstructed (PROVISIONAL — run still ongoing)</span>
+  <span><span class="swatch" style="background:#d62728"></span> reconstructed (RECONCILED — run resolved)</span>
+</div>
+
+<div id="empty">Waiting for the first sensor reading…</div>
+<div id="charts"></div>
+
+<script>
+console.log('[dashboard] script loaded — build: 2026-07-21-debug1');
+
+const MAX_CLIENT_POINTS = 2000;
+const charts = {};
+
+function keyOf(pointId, sensor) { return pointId + '|' + sensor; }
+
+async function ensureChart(pointId, sensor) {
+  const key = keyOf(pointId, sensor);
+  if (charts[key]) return charts[key];
+
+  document.getElementById('empty').style.display = 'none';
+
+  const container = document.createElement('div');
+  container.className = 'chart-container';
+  container.innerHTML = `
+    <h3>${sensor}</h3>
+    <div class="sub">point_id: ${pointId}</div>
+    <div class="plot"></div>
+  `;
+  document.getElementById('charts').appendChild(container);
+
+  // reconstructions keyed by start_time: an open-ended stuck run gets
+  // reconstructed repeatedly as it grows (by design — see live_store.py),
+  // each time with the SAME start_time and a later end_time. Keying by
+  // start_time means a refresh REPLACES the previous overlay for that
+  // window instead of piling up an extra Plotly trace per refresh —
+  // without this, a single long-running stuck period balloons trace
+  // count over time and Plotly.react() gets progressively slower with
+  // every redraw, eventually looking like the chart froze even though
+  // messages are still arriving fine.
+  const entry = { plotDiv: container.querySelector('.plot'), raw: { x: [], y: [] }, reconstructions: {} };
+  charts[key] = entry;
+
+  try {
+    // Relative (no leading '/') so this resolves under whatever path
+    // this page itself was served from — works unmodified both at
+    // domain root (local dev) and under an nginx subpath like
+    // /staleness/ (host241), with no server-side prefix config needed.
+    const resp = await fetch(`api/series/${encodeURIComponent(pointId)}/${encodeURIComponent(sensor)}`);
+    const data = await resp.json();
+    // Prepend (not overwrite) — a live 'point' message may have already
+    // arrived and been pushed onto entry.raw while this fetch was in
+    // flight; overwriting would silently drop it.
+    entry.raw.x = data.timestamps.concat(entry.raw.x);
+    entry.raw.y = data.values.concat(entry.raw.y);
+  } catch (e) {
+    console.error('Failed to load initial series for', key, e);
+  }
+
+  render(key);
+  return entry;
+}
+
+function render(key) {
+  const entry = charts[key];
+  if (!entry) return;
+
+  const traces = [
+    {
+      x: entry.raw.x, y: entry.raw.y, mode: 'lines', name: 'raw',
+      line: { color: '#1f77b4', width: 1.5 },
+      hovertemplate: '%{x}<br>%{y}<extra>raw</extra>',
+    },
+  ];
+  const shapes = [];
+
+  Object.values(entry.reconstructions).forEach((r) => {
+    const color = r.confidence === 'RECONCILED' ? '#d62728' : '#ff7f0e';
+    traces.push({
+      x: r.x, y: r.y, mode: 'lines',
+      name: r.confidence === 'RECONCILED' ? 'reconstructed (RECONCILED)' : 'reconstructed (PROVISIONAL)',
+      line: { color, width: 2, dash: 'dot' },
+      showlegend: false,
+      hovertemplate: `%{x}<br>%{y}<extra>${r.confidence}</extra>`,
+    });
+    shapes.push({
+      type: 'rect', xref: 'x', yref: 'paper',
+      x0: r.start, x1: r.end, y0: 0, y1: 1,
+      fillcolor: r.confidence === 'RECONCILED' ? 'rgba(214,39,40,0.15)' : 'rgba(255,127,14,0.15)',
+      line: { width: 0 },
+    });
+  });
+
+  console.debug('[dashboard] render()', key, 'raw points:', entry.raw.x.length, 'windows:', Object.keys(entry.reconstructions).length);
+
+  try {
+    Plotly.react(
+      entry.plotDiv,
+      traces,
+      {
+        margin: { t: 10, r: 10, b: 34, l: 46 },
+        paper_bgcolor: 'transparent',
+        plot_bgcolor: 'transparent',
+        font: { color: '#e6e6e6', size: 11 },
+        xaxis: { type: 'date', gridcolor: '#2a2f3a' },
+        yaxis: { gridcolor: '#2a2f3a' },
+        shapes,
+        showlegend: false,
+      },
+      { responsive: true, displayModeBar: false }
+    );
+  } catch (err) {
+    console.error('[dashboard] Plotly.react failed for', key, err);
+  }
+}
+
+function handlePoint(msg) {
+  ensureChart(msg.point_id, msg.sensor).then((entry) => {
+    entry.raw.x.push(msg.timestamp);
+    entry.raw.y.push(msg.value);
+    if (entry.raw.x.length > MAX_CLIENT_POINTS) {
+      entry.raw.x.shift();
+      entry.raw.y.shift();
+    }
+    console.debug('[dashboard] point', msg.sensor, msg.timestamp, msg.value, '-> buffer len', entry.raw.x.length);
+    render(keyOf(msg.point_id, msg.sensor));
+  });
+}
+
+function handleReconstruction(msg) {
+  ensureChart(msg.point_id, msg.sensor).then((entry) => {
+    // Keyed by start_time: a refresh of the same still-open window
+    // overwrites its previous entry instead of accumulating a new trace
+    // every single refresh (see the comment in ensureChart above).
+    entry.reconstructions[msg.start_time] = {
+      start: msg.start_time,
+      end: msg.end_time,
+      confidence: msg.confidence,
+      x: msg.values.map((v) => v.timestamp),
+      y: msg.values.map((v) => v.value),
+    };
+
+    // Separate concern from the refresh-dedup above: over a very long
+    // session, genuinely distinct RESOLVED periods (different
+    // start_times, so the dedup above doesn't touch them) can still pile
+    // up. Cap how many distinct windows we keep, dropping the oldest —
+    // matches the same "bound memory for an indefinitely-running live
+    // feed" reasoning as MAX_CLIENT_POINTS above and live_store.py's
+    // max_points server-side.
+    const MAX_TRACKED_WINDOWS = 200;
+    const keys = Object.keys(entry.reconstructions);
+    if (keys.length > MAX_TRACKED_WINDOWS) {
+      keys.sort();  // ISO timestamps sort chronologically as strings
+      delete entry.reconstructions[keys[0]];
+    }
+
+    render(keyOf(msg.point_id, msg.sensor));
+  });
+}
+
+function setStatus(connected, text) {
+  const el = document.getElementById('status');
+  const textEl = document.getElementById('status-text');
+  el.classList.toggle('connected', connected);
+  textEl.textContent = text;
+}
+
+function connect() {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  // Same subpath-relative logic as the fetch() calls above: build the
+  // WebSocket URL from the current page's own path rather than a
+  // hardcoded '/ws', so this works unmodified under an nginx subpath.
+  const basePath = window.location.pathname.endsWith('/')
+    ? window.location.pathname
+    : window.location.pathname + '/';
+  const ws = new WebSocket(`${proto}//${window.location.host}${basePath}ws`);
+
+  // A dead connection doesn't always fire onclose — e.g. the TCP
+  // connection can be silently dropped (common over WSL2/localhost)
+  // without a clean close frame, leaving the socket looking "open" and
+  // the reconnect logic below never triggering. This watchdog forces a
+  // reconnect if nothing has arrived in a while, regardless of whether
+  // onclose ever fires. 30s is generous relative to the producer's
+  // fastest realistic cadence — raise it if you're intentionally running
+  // a very low --speed and see false-positive reconnects.
+  const STALE_AFTER_MS = 30000;
+  let lastMessageAt = Date.now();
+  const watchdog = setInterval(() => {
+    if (Date.now() - lastMessageAt > STALE_AFTER_MS) {
+      console.warn('No WebSocket traffic for', STALE_AFTER_MS, 'ms — forcing reconnect');
+      clearInterval(watchdog);
+      ws.close();  // triggers onclose below, which schedules connect() again
+    }
+  }, 5000);
+
+  ws.onopen = () => {
+    lastMessageAt = Date.now();
+    setStatus(true, 'live');
+  };
+  ws.onclose = () => {
+    clearInterval(watchdog);
+    setStatus(false, 'disconnected — retrying…');
+    setTimeout(connect, 2000);
+  };
+  ws.onerror = () => ws.close();
+
+  ws.onmessage = (event) => {
+    lastMessageAt = Date.now();
+    const msg = JSON.parse(event.data);
+    if (msg.type === 'point') handlePoint(msg);
+    else if (msg.type === 'reconstruction') handleReconstruction(msg);
+  };
+}
+
+// Discover any sensors that already have data (e.g. dashboard restarted
+// mid-stream) before the WebSocket delivers anything new.
+async function loadKnownSeries() {
+  try {
+    const resp = await fetch('api/series');
+    const known = await resp.json();
+    for (const { point_id, sensor } of known) {
+      await ensureChart(point_id, sensor);
+    }
+  } catch (e) {
+    console.error('Failed to load known series list', e);
+  }
+}
+
+loadKnownSeries();
+connect();
+</script>
+
+</body>
+</html>

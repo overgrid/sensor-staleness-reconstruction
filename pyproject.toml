@@ -11,6 +11,9 @@ dependencies = [
     "typer>=0.12",
     "mlflow>=2.10",
     "gql[requests]>=3.5",
+    "kafka-python-ng>=2.2",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +35,13 @@ build-backend = "setuptools.build_meta"
 # not the repo root. This is what makes `pip install -e .` work.
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# dashboard.py serves dashboard_static/index.html at runtime — without
+# this, a non-editable install (a real `pip install .` / wheel build,
+# rather than `pip install -e .`) would silently drop the HTML file since
+# setuptools only bundles .py files by default.
+[tool.setuptools.package-data]
+staleness_pipeline = ["dashboard_static/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
