@@ -127,8 +127,11 @@ class LocalJSONLSink(MeasurementSink):
 
 
 class GraphQLSink(MeasurementSink):
-    """Stub. See module docstring — schema_1.gqls doesn't currently support
-    this safely. Deliberately not built yet."""
+    """Stub. Confirmed via schema_introspection.py's full-schema search
+    against the LIVE Overgrid API (not just the static schema_1.gqls
+    snapshot) — no imputation-aware field or mutation exists anywhere in
+    the schema as of this check. See docs/ARCHITECTURE.md for the date
+    and details. Deliberately not built until that changes."""
 
     def __init__(self, endpoint: str, token: str):
         self.endpoint = endpoint

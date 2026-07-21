@@ -24,16 +24,29 @@ Set it up however fits your shell/environment before running.
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import pandas as pd
 from gql import Client, gql
+from gql.transport.exceptions import TransportQueryError
 from gql.transport.requests import RequestsHTTPTransport
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_ENDPOINT = "https://legacy.overgrid.eu/graphql"
 
+# NOTE: equipment(flat: true, ...) has been observed to fail intermittently
+# with a server-side INTERNAL_ERROR. Confirmed NOT deterministic: the exact
+# same query with no code changes failed 3 times, then succeeded on a later
+# retry -- and flat:true genuinely matters (it surfaces equipment nested
+# under locations that a non-flat query misses entirely: 13 vs 10 devices
+# on one real project). So this stays in, with retry logic below handling
+# the flakiness, rather than being removed and silently under-reporting
+# real equipment.
 QUERY = gql(
     """
     query Projects(
@@ -106,6 +119,37 @@ def build_client(endpoint: str = DEFAULT_ENDPOINT, token: str | None = None) -> 
     return Client(transport=transport, fetch_schema_from_transport=False)
 
 
+def execute_with_retry(
+    client: Client,
+    query,
+    variables: dict,
+    max_retries: int = 3,
+    backoff_seconds: float = 2.0,
+):
+    """Execute a GraphQL query, retrying on TransportQueryError.
+
+    equipment(flat: true, ...) has been observed to fail intermittently
+    with a server-side INTERNAL_ERROR — the same query with no changes at
+    all has both failed and succeeded across separate runs. Retrying with
+    a short backoff is the honest response to a flaky dependency, rather
+    than avoiding whatever argument happened to be involved in one failed
+    attempt.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return client.execute(query, variable_values=variables)
+        except TransportQueryError as e:
+            last_error = e
+            if attempt < max_retries:
+                logger.warning(
+                    "GraphQL query failed (attempt %d/%d): %s — retrying in %.0fs",
+                    attempt, max_retries, e, backoff_seconds,
+                )
+                time.sleep(backoff_seconds)
+    raise last_error
+
+
 def fetch_points(
     client: Client,
     alias: str,
@@ -147,7 +191,7 @@ def fetch_points(
         "every": every,
         "fn": fn,
     }
-    result = client.execute(QUERY, variable_values=variables)
+    result = execute_with_retry(client, QUERY, variables)
 
     points_data: list[PointData] = []
     for project in result["projects"]:
