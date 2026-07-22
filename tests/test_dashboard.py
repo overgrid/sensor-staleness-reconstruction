@@ -10,11 +10,15 @@ wiring around it.
 
 from __future__ import annotations
 
+import asyncio
+import threading
+
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
 from staleness_pipeline import dashboard
+from staleness_pipeline.dashboard import _processing_loop as real_processing_loop
 from staleness_pipeline.live_store import UpdateEvent
 
 
@@ -31,12 +35,56 @@ class FakePipeline:
 @pytest.fixture(autouse=True)
 def no_real_infra(monkeypatch):
     """Every test in this file gets a Chronos pipeline that needs no
-    download, and a Kafka consumer loop that's a no-op — the background
-    thread in dashboard.py's lifespan starts and exits immediately
-    instead of blocking on a real broker connection."""
+    download, and both background threads (Kafka consumer, processing
+    loop) turned into no-ops — nothing in dashboard.py's lifespan should
+    block on real infrastructure during tests."""
     monkeypatch.setattr(dashboard, "get_chronos_pipeline", lambda: FakePipeline())
-    monkeypatch.setattr(dashboard, "_kafka_consumer_loop", lambda loop: None)
+    monkeypatch.setattr(dashboard, "_kafka_consumer_loop", lambda message_queue: None)
+    monkeypatch.setattr(dashboard, "_processing_loop", lambda message_queue, loop: None)
     yield
+
+
+def test_processing_loop_ingests_from_queue_and_broadcasts(monkeypatch):
+    """Exercises the REAL _processing_loop (not monkeypatched away here,
+    unlike the fixture default) against a fake store and a real queue —
+    proves messages placed on the queue actually get ingested and
+    broadcast, i.e. the consumer/processing split from the heartbeat-
+    starvation fix is wired correctly end to end."""
+    import queue as queue_module
+
+    broadcasted = []
+
+    class FakeStore:
+        def ingest(self, message):
+            return UpdateEvent(
+                point_id=message["point_id"],
+                sensor=message["sensor"],
+                timestamp=pd.Timestamp(message["timestamp"]),
+                value=message["value"],
+            )
+
+    async def fake_broadcast(msg):
+        broadcasted.append(msg)
+
+    monkeypatch.setattr(dashboard, "store", FakeStore())
+    monkeypatch.setattr(dashboard.manager, "broadcast", fake_broadcast)
+
+    q: "queue_module.Queue[dict]" = queue_module.Queue()
+    q.put({"point_id": "p1", "sensor": "aht_temperature", "timestamp": "2026-01-01T00:00:00+00:00", "value": 1.0})
+
+    async def run_one_iteration():
+        loop = asyncio.get_running_loop()
+        thread = threading.Thread(target=real_processing_loop, args=(q, loop), daemon=True)
+        thread.start()
+        # Give the background thread a moment to pull the message,
+        # ingest it, and schedule the broadcast coroutine onto this loop.
+        await asyncio.sleep(0.3)
+
+    asyncio.run(run_one_iteration())
+
+    assert len(broadcasted) == 1
+    assert broadcasted[0]["type"] == "point"
+    assert broadcasted[0]["value"] == 1.0
 
 
 def test_index_serves_html():

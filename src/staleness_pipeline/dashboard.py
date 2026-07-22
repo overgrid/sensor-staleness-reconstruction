@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import queue
 import threading
 from contextlib import asynccontextmanager
 from functools import partial
@@ -121,13 +122,25 @@ def event_to_messages(event: UpdateEvent) -> list[dict]:
     return messages
 
 
-def _kafka_consumer_loop(loop: asyncio.AbstractEventLoop) -> None:
-    """Runs in a background OS thread — kafka-python is blocking/sync, so
-    it can't run directly on the asyncio event loop. Each message is
-    ingested into the shared store, and any resulting broadcast messages
-    are handed back to the event loop via run_coroutine_threadsafe, since
-    WebSocket sends must happen there, not on this thread."""
-    assert store is not None
+def _kafka_consumer_loop(message_queue: "queue.Queue[dict]") -> None:
+    """Runs in its own OS thread with exactly one job: pull messages off
+    Kafka as fast as possible and hand them to a queue.
+
+    Deliberately kept free of ANY CPU-heavy work (detection, Chronos
+    reconstruction — see _processing_loop below). kafka-python's
+    consumer-group heartbeat runs on its own background thread, but that
+    thread still needs regular GIL/CPU time to actually send its pings on
+    schedule. If this thread were also doing synchronous Chronos
+    inference, holding the GIL for the duration, the heartbeat thread can
+    get starved long enough that the broker decides this consumer is
+    dead ("Heartbeat session expired, marking coordinator dead" — a real
+    failure mode observed in practice, not a hypothetical one) and kicks
+    it from the group, triggering a rebalance during which NO messages
+    get processed at all. Splitting consumption from processing means
+    this thread never does anything slower than a network read + a queue
+    put, so it can always service the heartbeat thread's needs regardless
+    of how long reconstruction takes on the other side of the queue.
+    """
     logger.info("Connecting Kafka consumer: topic=%s servers=%s", KAFKA_TOPIC, KAFKA_BOOTSTRAP_SERVERS)
     consumer = build_consumer(
         topic=KAFKA_TOPIC,
@@ -136,6 +149,20 @@ def _kafka_consumer_loop(loop: asyncio.AbstractEventLoop) -> None:
     )
 
     for message in consume_messages(consumer):
+        message_queue.put(message)
+
+
+def _processing_loop(message_queue: "queue.Queue[dict]", loop: asyncio.AbstractEventLoop) -> None:
+    """Runs in a separate OS thread — pulls messages off the queue at
+    whatever pace store.ingest() (including any Chronos reconstruction
+    calls it triggers) can actually sustain, completely decoupled from
+    the Kafka client. However slow this gets, it can never affect
+    consumer-group heartbeats, since it never touches the Kafka consumer
+    object at all."""
+    assert store is not None
+
+    while True:
+        message = message_queue.get()
         try:
             event = store.ingest(message)
         except Exception:
@@ -157,9 +184,14 @@ async def lifespan(app: FastAPI):
         min_stuck_hours=MIN_STUCK_HOURS,
     )
 
+    message_queue: "queue.Queue[dict]" = queue.Queue()
     loop = asyncio.get_event_loop()
-    thread = threading.Thread(target=_kafka_consumer_loop, args=(loop,), daemon=True)
-    thread.start()
+
+    consumer_thread = threading.Thread(target=_kafka_consumer_loop, args=(message_queue,), daemon=True)
+    processing_thread = threading.Thread(target=_processing_loop, args=(message_queue, loop), daemon=True)
+    consumer_thread.start()
+    processing_thread.start()
+
     logger.info("Live dashboard ready.")
     yield
 
